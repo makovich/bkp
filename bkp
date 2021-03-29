@@ -1,0 +1,199 @@
+#!/bin/sh
+#---help---
+# bkp 1.0
+# Usage:
+#
+#   bkp -i [ | ssh root@host sh ]
+#   bkp [ -m <message> ]
+#   [ ssh user@host ] lbu pkg - | bkp [ -m <message> ]
+#
+#   Initialize git repository and commit lbu change-set there
+#
+#   Basic idea:
+#   - clone lbu repo from origin in a temp dir without checking out
+#   - put all lbu tracked files there
+#   - git add --all && git commit
+#   - push revision to the origin, i.e. ~/bkp dir
+#
+# Options:
+#   -i   Install lbu hook that saves lbu files permissions
+#        (i.e. /etc/lbu/pre-package.d/save_lbu_perms)
+#   -m   Git commit message
+#
+# Files:
+#   /etc/lbu/perms.bkp  Executable script to re/store files permissions
+#   /etc/lbu/lbu.conf   File to place LBU_BACKUPDIR option
+#
+# Environment:
+#   LBU_BACKUPDIR       Path to git repository (ex.: /root/bkp)
+#
+# Homepage: <https://github.com/makovich/bkp>
+# See also: <https://github.com/makovich/alp>
+#---help---
+set -e
+
+readonly PERMS="perms.bkp"
+readonly PERMS_DIR="/etc/lbu"
+readonly HOOK="save_lbu_perms"
+readonly HOOK_DIR="/etc/lbu/pre-package.d"
+
+is_alpine() {
+  [ -f "/etc/alpine-release" ]
+}
+
+help() {
+  sed -n '/^#---help---/,/^#---help---/p' "$0" | sed 's/^# \{0,1\}//; 1d;$d;'
+}
+
+gen_hook() {
+  local eof="EOF"
+  local header='
+	#!/bin/sh
+
+	echo "Restoring permissions from $0..."
+	tail -n +15 "$0" | {
+	while read _ PERMS USER GROUP DATE TIME FILE; do
+	  [ ! -e "${FILE}" ] && continue
+	  chown -h "${USER}:${GROUP}" "${FILE}"
+	  [ ! -L "${FILE}" ] && chmod -f "${PERMS}" "${FILE}"
+	  touch -chd "${DATE} ${TIME}" "${FILE}"
+	  n=$((n+1))
+	done
+	echo "${n} item(s) affected."
+	}
+
+	'
+
+  cat <<-EOF
+	#!/bin/sh
+	set -eo pipefail
+
+	readonly perms_dir=${1?"No directory for permissions file provided"}
+	readonly perms_file=${2?"No name for permissions backup provided"}
+	readonly lbu_pkg_files="\$(mktemp -d)"
+
+	trap "rm -rf \${lbu_pkg_files}" EXIT INT TERM
+	cd "\${lbu_pkg_files}"
+	lbu list | xargs -I{} sh -c 'mkdir -p "\$(dirname "{}")" && touch "{}" >/dev/null 2>&1 || true'
+
+	cat > \$perms_dir/\$perms_file <<-'$eof'$header$eof
+
+	find * | awk "!/\$perms_file/" | sort -r | xargs -I{} sh -c 'stat -c "# %a %U %G %.19y .%n" /{} 2>/dev/null || true' >> \$perms_dir/\$perms_file
+	EOF
+}
+
+install_hook() {
+  if [ -p /dev/stdout ] && [ -z ${REMOTE_INSTALL} ]; then
+    sed '/^#---cut---/,$ d; s/^#---run--- //' "$0"
+    exit $?
+  fi
+
+  if ! is_alpine; then
+    echo 'Probably not Alpine Linux!'
+    exit 1;
+  fi
+
+  local hook_dir="${1:-${HOOK_DIR}}"
+  local hook_file="${2:-${HOOK}}"
+  local perms_dir="${3:-${PERMS_DIR}}"
+  local perms_file="${4:-${PERMS}}"
+
+  mkdir -p "$hook_dir"
+  gen_hook "$perms_dir" "$perms_file" | cat > "$hook_dir/$hook_file"
+  rc=$?
+
+  [ $rc -ne 0 ] && \
+    echo "Error while installing $hook_file into $hook_dir directory." && \
+    rm -f "$hook_dir/$hook_file" && \
+    exit $rc
+
+  chmod +x "$hook_dir/$hook_file"
+  echo "File $hook_file successfully installed into $hook_dir directory."
+}
+
+# Expected usage: bkp -i | ssh root@host sh
+#
+# Whenever `install_hook`'s stdout is a pipe and no REMOTE_INSTALL set,
+# script will `---cut---` itself below and pipe the rest out to the remote
+# shell interpreter. There it will `install_hook` again.
+#
+# Root permissions are to create /etc/lbu/pre-package.d/save_lbu_perms hook.
+#
+#---run--- REMOTE_INSTALL="yes"
+#---run--- install_hook
+#---cut---
+
+backup() {
+  local message="$1"
+  local store="$2"
+  local clone="$3"
+  local mode="$4"
+
+  if ! git -C "$store" tag >/dev/null 2>&1; then
+    if [ "$mode" == "bare" ]; then
+      git init --bare --shared=0600 "$store/.git"
+    else
+      git init "$store"
+      git config --local receive.denyCurrentBranch updateInstead
+    fi
+  fi
+
+  git clone --quiet --no-checkout "$store" "$clone"
+  cd "$clone"
+  tar -xzf -
+  git add --all
+
+  if [ $(git status --short | wc -l) -eq 0 ]; then
+    echo "No changes since last backup"
+    exit 0
+  fi
+
+  git commit --message "${message:-"auto"}"
+  git push origin
+}
+
+pipe_or_die() {
+  firstbyte=$(dd bs=1 count=1 2>/dev/null; echo .)
+  if [ "$firstbyte" != "." ]; then
+    { printf %s "${firstbyte%.}";
+      cat; } |
+    "$@"
+  fi
+}
+
+# Load non standard LBU_BACKUPDIR option
+[ -f /etc/lbu/lbu.conf ] && source /etc/lbu/lbu.conf
+
+while getopts ":him:" o; do
+  case "$o" in
+    i) install_hook; exit 0;;
+    m) MESSAGE="${OPTARG}";;
+    h) help; exit 0;;
+    *) echo "Invalid option -${OPTARG}." >&2; exit 1;;
+  esac
+done
+
+if is_alpine && [ $(id -u) -ne 0 ]; then
+  echo "bkp: Only for root."
+  exit 1
+fi
+
+if is_alpine && [ -t 0 ] && [ -z "${LBU_BACKUPDIR}" ]; then
+  echo "LBU_BACKUPDIR is not defined in /etc/lbu/lbu.conf"
+  exit 1
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  echo 'Git must be installed.'
+  exit 1
+fi
+
+CLONE_DIR="$(mktemp -du)"
+trap "rm -rf ${CLONE_DIR}" EXIT INT TERM
+
+if [ -t 0 ]; then
+  echo "Backing up to ${LBU_BACKUPDIR}..."
+  lbu pkg - | backup "${MESSAGE}" "${LBU_BACKUPDIR}" "${CLONE_DIR}" "bare"
+else
+  pipe_or_die backup "${MESSAGE}" "$(pwd)" "${CLONE_DIR}"
+fi
